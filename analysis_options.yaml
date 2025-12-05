@@ -1,0 +1,14 @@
+include: package:flutter_lints/flutter.yaml
+
+#include: package:lint/analysis_options.yaml
+
+# Packages, that may be distributed (i.e. via pub.dev) should use the package
+# version, resulting in a better pub score.
+# include: package:lint/analysis_options_package.yaml
+
+analyzer:
+  exclude:
+    - '**.freezed.dart'
+    - '**.config.dart'
+    - '**.g.dart'
+
