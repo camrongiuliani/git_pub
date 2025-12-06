@@ -1,41 +1,59 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+
+import 'package:path/path.dart' as p;
+import 'package:pub_semver/pub_semver.dart'; // For robust version sorting
 import 'package:shelf/shelf.dart';
 import 'package:shelf/shelf_io.dart' as io;
 import 'package:shelf_router/shelf_router.dart';
-import 'package:path/path.dart' as p;
-import 'package:pub_semver/pub_semver.dart'; // Dependency required for version sorting
 
 // --- CONFIGURATION ---
 
-// File name for the configuration JSON file to be read from PWD
+/// Name of the JSON configuration file expected in the current working directory.
 const String _configFileName = '.pub-git-proxy.json';
 
-// IMPORTANT: This map will now be loaded from the JSON file at runtime.
-// The structure of the JSON file must match:
-// { "my_private_package": { "gitUrl": "https://..." }, ... }
+/// Holds the package configurations loaded from the JSON file.
+///
+/// The key is the package name, and the value is a record containing the Git URL.
+/// Example: { "my_package": (gitUrl: "https://github.com/user/repo.git") }
 late final Map<String, ({String gitUrl})> _packageConfig;
 
-// Local directory to clone and cache the Git repositories.
+/// Directory path for caching cloned Git repositories.
+///
+/// Using a temporary directory ensures that the cache is cleaned up on system restart.
 final String _gitCacheDir =
     p.join(Directory.systemTemp.path, 'pub_git_proxy_cache');
-// File path to store the server's Process ID (PID)
-final String _pidFilePath = p.join(Directory.systemTemp.path, 'savpub.pid');
-final String _hostname = '0.0.0.0';
-final int _port = 8080;
 
-// In-memory cache for Git tags to prevent repeated remote calls
+/// File path for storing the server's process ID (PID) to manage its lifecycle.
+final String _pidFilePath = p.join(Directory.systemTemp.path, 'savpub.pid');
+
+/// The hostname the server will listen on. '0.0.0.0' makes it accessible from any network interface.
+const String _hostname = '0.0.0.0';
+
+/// The port the server will listen on. Can be overridden with the --port CLI flag.
+int _port = 8080;
+
+/// In-memory cache for storing Git tags (versions) for each package.
+///
+/// This avoids costly `git ls-remote` calls for every version request.
+/// The key is the package name, and the value is a list of version strings.
 final Map<String, List<String>> _tagsCache = {};
 
 // --- UTILITIES ---
 
-/// Executes a git command and handles potential errors.
+/// Executes a Git command asynchronously and returns its standard output.
+///
+/// Throws an exception if the command fails (exits with a non-zero code).
+///
+/// - [args]: The arguments to pass to the `git` executable.
+/// - [workingDirectory]: The directory where the command should be executed.
 Future<String> _runGit(List<String> args, {String? workingDirectory}) async {
   final result =
       await Process.run('git', args, workingDirectory: workingDirectory);
 
   if (result.exitCode != 0) {
+    // Log detailed error information for easier debugging.
     print('Git Error (Exit Code ${result.exitCode}): ${args.join(' ')}');
     print('Stdout: ${result.stdout}');
     print('Stderr: ${result.stderr}');
@@ -44,16 +62,18 @@ Future<String> _runGit(List<String> args, {String? workingDirectory}) async {
   return result.stdout.toString();
 }
 
-/// Loads the package configuration from the .pub-git-proxy.json file.
+/// Loads and validates the package configuration from the `.pub-git-proxy.json` file.
+///
+/// This file must be present in the directory where the script is executed.
 Future<Map<String, ({String gitUrl})>> _loadPackageConfig() async {
   final configFile = File(_configFileName);
 
   if (!configFile.existsSync()) {
     throw FileSystemException(
-      'Configuration file not found',
+      'Configuration file not found.',
       configFile.path,
-      OSError(
-        'Please create a "$_configFileName" file in the current directory with your package mappings.',
+      const OSError(
+        'Please create a "$_configFileName" file in the current directory.',
       ),
     );
   }
@@ -64,8 +84,9 @@ Future<Map<String, ({String gitUrl})>> _loadPackageConfig() async {
     final content = await configFile.readAsString();
     final Map<String, dynamic> jsonMap = json.decode(content);
 
-    final Map<String, ({String gitUrl})> config = {};
+    final config = <String, ({String gitUrl})>{};
 
+    // Validate and parse the JSON structure.
     jsonMap.forEach((key, value) {
       if (value is Map<String, dynamic> &&
           value.containsKey('gitUrl') &&
@@ -73,13 +94,15 @@ Future<Map<String, ({String gitUrl})>> _loadPackageConfig() async {
         config[key] = (gitUrl: value['gitUrl'] as String);
       } else {
         throw FormatException(
-            'Invalid configuration for package "$key". Expected {"gitUrl": "..."}.');
+          'Invalid configuration for package "$key". Expected `{"gitUrl": "..."}`.',
+        );
       }
     });
 
     if (config.isEmpty) {
       throw Exception(
-          'Configuration file is empty or contains no valid packages.');
+        'Configuration file is empty or contains no valid packages.',
+      );
     }
 
     print('Successfully loaded ${config.length} package configuration(s).');
@@ -88,16 +111,23 @@ Future<Map<String, ({String gitUrl})>> _loadPackageConfig() async {
     throw Exception('Error reading configuration file: ${e.message}');
   } on FormatException catch (e) {
     throw Exception(
-        'Configuration file is not valid JSON or has an invalid structure: $e');
-  } catch (e) {
-    rethrow;
+      'Configuration file is not valid JSON or has an invalid structure: $e',
+    );
   }
 }
 
-/// Dynamically fetches all available semantic version tags from a Git repository.
+/// Fetches all semantic version tags from a remote Git repository.
+///
+/// It uses `git ls-remote` for efficiency, avoiding a full clone.
+/// Results are cached in memory to speed up subsequent requests.
+///
+/// - [packageName]: The name of the package, used for caching.
+/// - [gitUrl]: The remote URL of the Git repository.
 Future<List<String>> _getAvailableTags(
-    String packageName, String gitUrl) async {
-  // Check cache first
+  String packageName,
+  String gitUrl,
+) async {
+  // Return cached tags if available.
   if (_tagsCache.containsKey(packageName)) {
     return _tagsCache[packageName]!;
   }
@@ -105,107 +135,109 @@ Future<List<String>> _getAvailableTags(
   print('Fetching tags for $packageName from $gitUrl...');
 
   try {
-    // Use `git ls-remote` for fast tag retrieval without needing a full clone
+    // `ls-remote` lists references from a remote repository.
     final result = await _runGit(['ls-remote', '--tags', gitUrl]);
 
-    // Parse the output (e.g., "SHA\trefs/tags/v1.2.3")
+    // Parse the output to extract tag names.
+    // Example output line: "f1b2c3d... refs/tags/v1.2.3"
     final tags = result
         .split('\n')
         .map((line) {
           if (line.isEmpty) return null;
           final parts = line.split('\t');
-          // Extract the tag name, which is the last part after the last slash
+          // e.g., "refs/tags/v1.2.3" -> "v1.2.3"
           return parts.last.split('/').last;
         })
-        .where((tag) => tag != null && tag!.isNotEmpty)
+        .whereType<String>() // Filter out nulls
         .map((tag) {
-          // Remove leading 'v' if present (e.g., v1.0.0 -> 1.0.0)
-          if (tag!.startsWith('v') &&
+          // Normalize tags by removing a leading 'v' (e.g., "v1.0.0" -> "1.0.0").
+          if (tag.startsWith('v') &&
               tag.length > 1 &&
               RegExp(r'\d').hasMatch(tag[1])) {
             return tag.substring(1);
           }
           return tag;
         })
-        // Simple filter to try and keep only valid SemVer tags (e.g., 1.2.3)
-        .where((tag) => RegExp(r'^\d+\.\d+\.\d+').hasMatch(tag!))
-        .toList()
-        .cast<String>();
+        // Ensure tags follow a basic SemVer pattern (e.g., "1.2.3").
+        .where((tag) => RegExp(r'^\d+\.\d+\.\d+').hasMatch(tag))
+        .toList();
 
-    // Update cache and return
-    _tagsCache[packageName] = tags;
+    _tagsCache[packageName] = tags; // Cache the result.
     print('Found ${tags.length} versions for $packageName.');
     return tags;
   } catch (e) {
     print('Failed to fetch tags for $packageName: $e');
-    return []; // Return empty list on failure
+    return []; // Return an empty list on failure to prevent server crashes.
   }
 }
 
-// --- HANDLERS ---
+// --- HTTP HANDLERS ---
 
-/// Handles the GET /api/packages/<package> request (to list versions)
-/// Pub expects a JSON response with the package name and a list of available versions.
+/// Responds to `GET /api/packages/<packageName>`.
+///
+/// This endpoint mimics the official pub server's package metadata API. It returns
+/// a JSON object containing a list of all available versions for the package.
 Future<Response> _handlePackageRequest(
-    Request request, String packageName) async {
+  Request request,
+  String packageName,
+) async {
   final config = _packageConfig[packageName];
 
   if (config == null) {
     return Response.notFound(
-        'Package "$packageName" not found in proxy configuration.');
+      'Package "$packageName" not found in proxy configuration.',
+    );
   }
 
-  // Dynamically fetch all available versions (tags)
   final availableVersions = await _getAvailableTags(packageName, config.gitUrl);
 
   if (availableVersions.isEmpty) {
     return Response.internalServerError(
-        body: 'Could not retrieve any versions from Git repository.');
+      body: 'Could not retrieve any versions from the Git repository.',
+    );
   }
 
-  // 1. Convert string versions to Version objects for proper semantic sorting
+  // 1. Parse strings into `Version` objects for correct semantic version sorting.
   final versionObjects = availableVersions
       .map((v) {
         try {
           return Version.parse(v);
-        } catch (e) {
-          return null;
+        } catch (_) {
+          return null; // Ignore non-parsable versions.
         }
       })
-      .where((v) => v != null)
+      .whereType<Version>()
       .toList()
-    ..sort(); // Sorts ascending based on semantic versioning rules
+    ..sort(); // Sorts according to SemVer rules (e.g., 1.0.10 > 1.0.9).
 
-  // 2. Map all version objects into the complex format Pub expects
-  final List<Map<String, dynamic>> versions = versionObjects.map((vObject) {
+  // 2. Format the version data into the structure expected by the pub client.
+  final versions = versionObjects.map((vObject) {
     final v = vObject.toString();
+    // The URL where the pub client can download the tarball for this version.
     final archiveUrl =
         'http://${request.requestedUri.host}:${request.requestedUri.port}/api/packages/$packageName/versions/$v.tar.gz';
 
-    // Note: This uses a static/minimal pubspec structure.
     return {
       'version': v,
       'retracted': false,
       'pubspec': {
         'name': packageName,
         'version': v,
-        'environment': {'sdk': '>=3.0.0 <4.0.0'}, // Standard environment
+        'environment': {'sdk': '>=3.0.0 <4.0.0'}, // Generic SDK constraint.
       },
       'archive_url': archiveUrl,
     };
   }).toList();
 
-  // 3. Identify the latest version (the last one after sorting)
+  // 3. The latest version is the last one in the sorted list.
   final latestVersion = versionObjects.last.toString();
-
-  // 4. Find the 'latest' object from the list generated above
   final latestVersionObject =
       versions.firstWhere((v) => v['version'] == latestVersion);
 
-  // 5. Construct the final compliant pub API response
+  // 4. Construct the final JSON response body.
   final jsonResponse = {
     'name': packageName,
-    'isDiscontinued': false, // Not discontinued
+    'isDiscontinued': false,
     'latest': latestVersionObject,
     'versions': versions,
   };
@@ -216,22 +248,27 @@ Future<Response> _handlePackageRequest(
   );
 }
 
-/// Handles the GET /api/packages/<package>/versions/<version>.tar.gz request (to serve the archive)
+/// Responds to `GET /api/packages/<package>/versions/<version>.tar.gz`.
+///
+/// This endpoint serves a gzipped tarball of the package's source code for a specific version.
 Future<Response> _handleArchiveRequest(
-    Request request, String packageName, String version) async {
+  Request request,
+  String packageName,
+  String version,
+) async {
   final config = _packageConfig[packageName];
 
   if (config == null) {
     return Response.notFound(
-        'Package "$packageName" not found in proxy configuration.');
+      'Package "$packageName" not found in proxy configuration.',
+    );
   }
 
-  // The Pub client has already determined the exact version (tag) it needs based on the range.
   final packageDir = p.join(_gitCacheDir, packageName);
   final archivePath = p.join(_gitCacheDir, '$packageName-$version.tar.gz');
 
   try {
-    // 1. Ensure the package directory exists (Clone if necessary)
+    // 1. Clone the repository if not already cached, or fetch latest tags if it is.
     final dir = Directory(packageDir);
     if (!dir.existsSync()) {
       print('Cloning $packageName from ${config.gitUrl}...');
@@ -240,62 +277,59 @@ Future<Response> _handleArchiveRequest(
         workingDirectory: _gitCacheDir,
       );
     } else {
-      // Ensure local repo is up to date with tags
       print('Fetching latest tags for $packageName...');
       await _runGit(['fetch', '--tags'], workingDirectory: packageDir);
     }
 
-    // 2. Checkout the specific tag/version requested by the Pub client
+    // 2. Check out the specific git tag corresponding to the requested version.
     print('Checking out version $version...');
-    // We try 'tags/v$version' and 'tags/$version' as tags can sometimes have a 'v' prefix
     try {
-      await _runGit(['checkout', 'tags/v$version', '-f'],
-          workingDirectory: packageDir);
+      // Try with a 'v' prefix first, as it's a common convention.
+      await _runGit(
+        ['checkout', 'tags/v$version', '-f'],
+        workingDirectory: packageDir,
+      );
     } catch (_) {
-      await _runGit(['checkout', 'tags/$version', '-f'],
-          workingDirectory: packageDir);
+      // Fallback to checking out the tag without the 'v' prefix.
+      await _runGit(
+        ['checkout', 'tags/$version', '-f'],
+        workingDirectory: packageDir,
+      );
     }
 
-    // 3. Create the compressed archive (tar -czf)
+    // 3. Create a compressed tarball (.tar.gz) of the checked-out code.
     print('Creating archive at $archivePath...');
 
-    // We use a temporary directory for archiving to ensure we only compress the package content
+    // Use a temporary directory to stage files for archiving, excluding the .git folder.
     final tempArchiveDir = Directory(
-        p.join(Directory.systemTemp.path, 'pub_archive_temp', packageName));
+      p.join(Directory.systemTemp.path, 'pub_archive_temp', packageName),
+    );
     if (tempArchiveDir.existsSync()) {
       await tempArchiveDir.delete(recursive: true);
     }
     await tempArchiveDir.create(recursive: true);
 
-    // Copy package contents (excluding the .git folder)
-    await for (final entity in dir.list(recursive: false)) {
-      final baseName = p.basename(entity.path);
-      if (baseName != '.git') {
-        final targetPath = p.join(tempArchiveDir.path, baseName);
-        if (entity is Directory) {
-          await Process.run('cp', ['-r', entity.path, targetPath]);
-        } else if (entity is File) {
-          await entity.copy(targetPath);
-        }
+    // Copy repository contents to the staging area.
+    await for (final entity in dir.list(followLinks: false)) {
+      if (p.basename(entity.path) != '.git') {
+        final targetPath = p.join(tempArchiveDir.path, p.basename(entity.path));
+        // Use system 'cp' for simplicity in copying directories.
+        await Process.run('cp', ['-r', entity.path, targetPath]);
       }
     }
 
-    // Create tar.gz archive
-    // Change directory to the parent of the package to archive the folder itself
+    // Create the tarball from the staging directory.
     final archiveResult = await Process.run(
-        'tar',
-        [
-          '-czf',
-          archivePath,
-          packageName // Archive the package folder name itself
-        ],
-        workingDirectory: tempArchiveDir.parent.path);
+      'tar',
+      ['-czf', archivePath, packageName],
+      workingDirectory: tempArchiveDir.parent.path,
+    );
 
     if (archiveResult.exitCode != 0) {
       throw Exception('Tar command failed: ${archiveResult.stderr}');
     }
 
-    // 4. Serve the archive file
+    // 4. Stream the created tarball back to the client.
     print('Serving archive $archivePath...');
     final file = File(archivePath);
     return Response.ok(
@@ -310,15 +344,16 @@ Future<Response> _handleArchiveRequest(
   } catch (e) {
     print('Archive generation error: $e');
     return Response.internalServerError(
-        body: 'Failed to generate package archive: $e');
+      body: 'Failed to generate package archive: $e',
+    );
   }
 }
 
-// --- SERVER LOGIC ---
+// --- SERVER LIFECYCLE ---
 
-/// Runs the Shelf server and writes the PID to a file.
+/// Initializes and runs the Shelf HTTP server.
 Future<void> _runServer() async {
-  // 1. Load configuration first
+  // 1. Load configuration on startup.
   try {
     _packageConfig = await _loadPackageConfig();
   } catch (e) {
@@ -326,7 +361,7 @@ Future<void> _runServer() async {
     exit(1);
   }
 
-  // 2. Ensure the cache directory exists
+  // 2. Ensure the Git cache directory exists.
   final cacheDir = Directory(_gitCacheDir);
   if (!cacheDir.existsSync()) {
     cacheDir.createSync(recursive: true);
@@ -335,144 +370,174 @@ Future<void> _runServer() async {
     print('Using existing Git cache directory: $_gitCacheDir');
   }
 
-  // Define the router
+  // 3. Define the server's routing rules.
   final router = Router()
     ..get('/api/packages/<packageName>', _handlePackageRequest)
     ..get('/api/packages/<packageName>/versions/<version>.tar.gz',
         (Request request, String packageName, String version) {
+      // The pub client might request '1.0.0.tar.gz', so we clean it up.
       final cleanVersion = version.endsWith('.tar.gz')
           ? version.substring(0, version.length - 7)
           : version;
       return _handleArchiveRequest(request, packageName, cleanVersion);
     })
     ..get(
-        '/',
-        (_) =>
-            Response.ok('SavPub Git Proxy is running on $_hostname:$_port.'));
+      '/',
+      (_) => Response.ok('SavPub Git Proxy is running on $_hostname:$_port.'),
+    );
 
-  // Middleware to log requests
+  // 4. Set up the request handler pipeline with logging.
   final handler =
-      const Pipeline().addMiddleware(logRequests()).addHandler(router);
+      const Pipeline().addMiddleware(logRequests()).addHandler(router.call);
 
+  // 5. Start the server and handle potential port conflicts.
   try {
     final server = await io.serve(handler, _hostname, _port);
-
-    // Write the PID to the file *after* successful startup
     await File(_pidFilePath).writeAsString(pid.toString());
 
     print('SavPub started successfully!');
     print('Server PID: $pid');
     print(
-        'Serving Dart Pub Git Proxy at http://${server.address.host}:${server.port}');
-    print(
-        'Press Ctrl-C to stop (or use "savpub stop" if run as a background service).');
+      'Serving Dart Pub Git Proxy at http://${server.address.host}:$_port',
+    );
+    print('Press Ctrl-C to stop (or use "git_pub stop").');
   } on SocketException catch (e) {
     if (e.message.contains('Address already in use')) {
       print(
-          'Error: Port $_port is already in use. Please stop the running process or choose a different port.');
+        'Error: Port $_port is already in use. Please stop the running process or choose a different port.',
+      );
+      // Clean up the PID file if the server fails to start
+      final pidFile = File(_pidFilePath);
+      if (pidFile.existsSync()) {
+        pidFile.deleteSync();
+      }
+      exit(1);
     } else {
       rethrow;
     }
   }
 }
 
-// --- COMMAND LOGIC ---
+// --- COMMAND-LINE INTERFACE ---
 
+/// Prints the CLI usage instructions.
 void _printUsage() {
-  print('Usage: dart run pub_git_proxy.dart <command>');
+  print('Usage: dart run git_pub.dart [options] <command>');
+  print('');
+  print('A local pub server proxy for private Git repositories.');
+  print('');
+  print('Options:');
+  print('  --port <number>    Sets the server port (default: 8080).');
   print('');
   print('Commands:');
-  print('  start    Start the SavPub server (runs in foreground).');
-  print('  stop     Stop the running SavPub server using its PID.');
-  print('  restart  Stop and then start the SavPub server.');
+  print(
+    '  start    Start the server. If it is already running, it will be stopped first.',
+  );
+  print('  stop     Stop the running server.');
+  print('  restart  Restart the server and clear the in-memory tag cache.');
 }
 
-/// CLI command to start the server.
+/// Handles the `start` command. If the server is already running, it will be
+/// automatically stopped before starting a new instance.
 Future<void> _startCommand() async {
   final pidFile = File(_pidFilePath);
   if (pidFile.existsSync()) {
-    try {
-      final pid = int.parse(await pidFile.readAsString());
-      // Note: In a real-world CLI, you'd check if the PID is actually running.
-      // For simplicity here, we assume if the file exists, the server is running.
-      print(
-          'Server appears to be already running with PID $pid. Use "savpub restart" or "savpub stop".');
-      return;
-    } catch (_) {
-      // PID file is corrupt, proceed to start
-      await pidFile.delete().catchError((_) {});
-    }
+    print(
+      'Server appears to be already running. Automatically stopping it first...',
+    );
+    await _stopCommand();
+    // Wait a moment for the port to be released.
+    await Future.delayed(const Duration(seconds: 1));
   }
 
   await _runServer();
 }
 
-/// CLI command to stop the server.
+/// Handles the `stop` command.
 Future<void> _stopCommand() async {
   final pidFile = File(_pidFilePath);
   if (!pidFile.existsSync()) {
-    print('Server is not running (PID file not found at $_pidFilePath).');
+    print('Server is not running (PID file not found).');
     return;
   }
 
   try {
-    final pid = int.parse(await pidFile.readAsString());
-    print('Attempting to stop SavPub server with PID $pid...');
+    final pidValue = int.parse(await pidFile.readAsString());
+    print('Stopping server with PID $pidValue...');
 
-    final success = Process.killPid(pid, ProcessSignal.sigterm);
-
-    if (success) {
-      print('Successfully sent termination signal to PID $pid.');
-      // Wait a moment for the process to exit and clean up
-      await Future.delayed(Duration(seconds: 1));
+    // Send a termination signal to the process.
+    if (Process.killPid(pidValue)) {
+      print('Successfully sent termination signal to PID $pidValue.');
+      // Give it a moment to shut down gracefully.
+      await Future.delayed(const Duration(seconds: 1));
     } else {
       print(
-          'Warning: Could not send signal to PID $pid. It might be dead already.');
+        'Warning: Could not signal PID $pidValue. It may have already exited.',
+      );
     }
-
-    // Clean up the PID file
-    await pidFile.delete();
-    print('SavPub server stopped and PID file cleaned up.');
   } catch (e) {
-    print('Error stopping server: $e');
-    await pidFile.delete().catchError((_) {}); // Try to clean up corrupted file
+    print(
+      'Error stopping server: $e. The process may need to be stopped manually.',
+    );
+  } finally {
+    // Always attempt to clean up the PID file.
+    if (pidFile.existsSync()) {
+      await pidFile.delete();
+      print('PID file cleaned up.');
+    }
   }
 }
 
-/// CLI command to restart the server.
+/// Handles the `restart` command.
 Future<void> _restartCommand() async {
-  print('Initiating SavPub restart...');
-  // Clear the in-memory tag cache on restart
-  _tagsCache.clear();
+  print('Restarting server...');
+  _tagsCache.clear(); // Clear in-memory cache on restart.
   await _stopCommand();
-  // Wait briefly for resources (port) to be freed
-  await Future.delayed(Duration(seconds: 1));
+  await Future.delayed(const Duration(seconds: 1)); // Wait for port to free up.
   await _startCommand();
 }
 
-// --- MAIN CLI DISPATCHER ---
-
+/// Main entry point for the command-line application.
 void main(List<String> arguments) async {
-  if (arguments.isEmpty) {
+  final args = List<String>.from(arguments);
+
+  // Find and extract the --port argument.
+  final portIndex = args.indexOf('--port');
+  if (portIndex != -1) {
+    if (portIndex + 1 >= args.length) {
+      print('Error: Missing value for --port argument.');
+      _printUsage();
+      exit(1);
+    }
+    try {
+      _port = int.parse(args[portIndex + 1]);
+      // Remove the flag and its value to not interfere with command parsing.
+      args.removeRange(portIndex, portIndex + 2);
+    } catch (e) {
+      print(
+        'Error: Invalid port number "${args[portIndex + 1]}". Must be an integer.',
+      );
+      exit(1);
+    }
+  }
+
+  if (args.isEmpty) {
+    print('Error: A command (start, stop, restart) is required.');
     _printUsage();
     return;
   }
 
-  final command = arguments.first.toLowerCase();
+  final command = args.first.toLowerCase();
 
   switch (command) {
     case 'start':
       await _startCommand();
-      break;
     case 'stop':
       await _stopCommand();
-      break;
     case 'restart':
       await _restartCommand();
-      break;
     default:
       print('Unknown command: "$command"');
       _printUsage();
-      break;
   }
 }
