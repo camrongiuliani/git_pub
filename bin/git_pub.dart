@@ -215,7 +215,7 @@ Future<Response> _handlePackageRequest(
     final v = vObject.toString();
     // The URL where the pub client can download the tarball for this version.
     final archiveUrl =
-        'http://${request.requestedUri.host}:${request.requestedUri.port}/api/packages/$packageName/versions/$v.tar.gz';
+        'http://${request.requestedUri.host}:$_port/api/packages/$packageName/versions/$v.tar.gz';
 
     return {
       'version': v,
